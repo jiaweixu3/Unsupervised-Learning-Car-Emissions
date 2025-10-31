@@ -1,0 +1,1508 @@
+---
+title: "Unsupervised Learning. Car Fuel Emissions."
+author: "Iván López Anca, Jiawei Xu"
+date: "UC3M, 2024"
+output:
+  html_document:
+    theme: flatly
+    highlight: pygments
+    toc: yes
+    toc_depth: 3
+    df_print: paged
+editor_options:
+  chunk_output_type: console
+---
+
+```{r global_options, include=T, echo = F}
+knitr::opts_chunk$set(echo = T, warning=FALSE, message=FALSE)
+options(max.print = 500)
+```
+
+```{r}
+rm(list=ls())
+```
+
+# 0. LIBRARIES
+
+We start loading some libraries
+
+```{r}
+library(tidyverse)
+library(sf)
+library(stringr)
+library(VIM)
+library(ggplot2)
+library(reshape2)
+library(tidyr)
+library(dplyr)
+library(gridExtra)
+library(mice)
+library(GGally)
+library(plotly)
+library(factoextra)
+library(cluster)
+library(mclust)
+```
+
+
+# 1. DATA PREPROCESSING
+
+We start analyzing the type of data.
+
+```{r}
+data = read.csv("car.csv")
+str(data)
+summary(data)
+```
+
+## Initial Data Cleaning and Feature Engineering
+
+### Irrelevant Features
+
+We start removing some features that we find irrelevant:
+<br> 
+- file: It just show from which file the data comes from.
+<br>
+- description: Too specific description of the car.
+<br>
+- tax_band: Taxes, meaningless for our analysis about the emissions.
+<br>
+- transmission: Too specific type of transmission of the car, we rather use transmission_type, which is more broad
+<br>
+- urban_imperial, extra_urban_imperial, and combined_imperial: It is redundant since they explain the same than urban_metric, extra_urban_metric and combined_metric but in different units.
+
+```{r}
+data = data[, -c(1, 5, 7, 8, 15, 16, 17)]
+```
+
+We have to check if there are duplicate values, and eliminate them:
+
+```{r}
+data <- data[!duplicated(data), ]
+```
+
+### First Exploration of Missing Values and Combination of a Feature
+
+Several variables were found to have more than 50% missing values. To ensure the accuracy of the analysis, we removed these variables.
+
+Additionally, the "particulates emissions" variable, originally stored as a character type, will be converted to numeric for proper processing.
+
+```{r}
+# First, we noted that, particulates_emissions, date_of_change, transmission_type and fuel_type are categorical variables that do not show all of their NA values but have "" instead, so we fix this error.
+
+data$date_of_change[data$date_of_change == ""] = NA
+data$particulates_emissions[data$particulates_emissions == ""] = NA
+data$transmission_type[data$transmission_type == ""] = NA
+data$fuel_type[data$fuel_type == ""] = NA
+
+# Now, we identify the missing data
+missing_data = colMeans(is.na(data))
+print(missing_data)
+
+# Now, we create data frame with the percentage of NAs
+missing_df = data.frame(
+  variable = names(missing_data),
+  missing_percentage = missing_data * 100)
+
+# Plot using ggplot2
+ggplot(missing_df, aes(x = reorder(variable, missing_percentage), y = missing_percentage)) +
+  geom_bar(stat = "identity", fill = "darkcyan") +
+  coord_flip() +
+  labs(x = "Variable", y = "Missing Data Percentage", 
+       title = "Missing Data Percentages") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        plot.title = element_text(hjust = 0.5))
+
+```
+
+Seeing that we have more than 50% of NAs in some features, they will be imprecise to use, so we must remove them.
+
+```{r}
+data = data[,-c(13, 16, 17, 20, 21, 22, 23, 24)]
+```
+
+Then, We noted that both fuel_cost_12000_miles and fuel_cost_6000_miles have a lot of missing values, but that when one has NA value, the other do have a value, so we checked it and then we combined them into one variable called fuel_cost
+
+```{r}
+
+# check that out guess is true
+
+check_condition = with(data, all((is.na(fuel_cost_12000_miles) & !is.na(fuel_cost_6000_miles)) |
+                               (!is.na(fuel_cost_12000_miles) & is.na(fuel_cost_6000_miles)) |
+                               (is.na(fuel_cost_12000_miles) & is.na(fuel_cost_6000_miles))))
+
+print(check_condition)
+
+# combine the variables
+
+data$fuel_cost = ifelse(
+  !is.na(data$fuel_cost_6000_miles), 
+  data$fuel_cost_6000_miles, 
+  data$fuel_cost_12000_miles / 2
+)
+
+# now we eliminate the previous 2 variables to reduce use of resources
+
+data$fuel_cost_12000_miles = NULL
+data$fuel_cost_6000_miles = NULL
+
+```
+
+### Transformation of variables
+
+We want to transform some numerical and categorical variables to factors.
+
+```{r}
+
+# First, we analyze how many labels would they have
+print(unique(data$fuel_type))
+print(unique(data$transmission_type))
+# We note that transmission_type has some NAs as "N/A"
+print(unique(data$euro_standard))
+data$transmission_type[data$transmission_type == "N/A"] = NA
+
+# Now we factorize them
+data$fuel_type = factor(data$fuel_type, 
+                         levels = c("Petrol", "Diesel", "LPG", "Petrol Hybrid", "CNG", 
+                                    "Petrol Electric", "LPG / Petrol", "Petrol / E85 (Flex Fuel)", 
+                                    "Petrol / E85", "Diesel Electric", "Electricity/Petrol", 
+                                    "Electricity", "Electricity/Diesel"), 
+                         labels = c("Petrol", "Diesel", "LPG", "Petrol Hybrid", "CNG", 
+                                    "Petrol Electric", "LPG / Petrol", "Petrol / E85 (Flex Fuel)", 
+                                    "Petrol / E85", "Diesel Electric", "Electricity/Petrol", 
+                                    "Electricity", "Electricity/Diesel"))
+
+data$transmission_type = factor(data$transmission_type, 
+                                 levels = c("Manual", "Automatic"), 
+                                 labels = c("Manual", "Automatic"))
+
+data$euro_standard = factor(data$euro_standard, 
+                              levels = c(2, 3, 4, 5, 6), 
+                              labels = c("Euro 2", "Euro 3", "Euro 4", "Euro 5", "Euro 6"))
+```
+
+## Outliers
+
+First we are using the 3-sigma rule to see how many outliers do each variable have. We are selecting the numeric ones since only they can have outliers.
+
+```{r}
+numeric_columns = sapply(data, is.numeric)
+
+outlier_counts = sapply(data[, numeric_columns], function(x) {
+  mu = mean(x, na.rm = TRUE)
+  sigma = sd(x, na.rm = TRUE)
+  sum(x < mu - 3*sigma | x > mu + 3*sigma, na.rm = TRUE)
+})
+
+outlier_counts
+```
+
+Now we may identify each outlier using a boxplot
+
+```{r}
+# Reshape the data into long format
+long_data = data %>%
+  select(where(is.numeric)) %>%
+  pivot_longer(cols = everything(), names_to = "variable", values_to = "value")
+
+# Create a giant plot with boxplots for all numeric variables
+ggplot(long_data, aes(x = variable, y = value)) +
+  geom_boxplot(fill = "lightblue", color = "blue", outlier.color = "red", outlier.shape = 16) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +  # Rotate x-axis labels
+  labs(x = "Variables", y = "Values") +
+  ggtitle("Boxplots for All Numeric Variables")
+```
+
+Now we do it again scaling the data
+
+```{r}
+# Reshape the data into long format
+long_data = data %>%
+  select(where(is.numeric)) %>%
+  mutate(across(everything(), scale)) %>%
+  pivot_longer(cols = everything(), names_to = "variable", values_to = "value")
+
+# Create a giant plot with boxplots for all numeric variables
+ggplot(long_data, aes(x = variable, y = value)) +
+  geom_boxplot(fill = "lightblue", color = "blue", outlier.color = "red", outlier.shape = 16) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +  # Rotate x-axis labels
+  labs(x = "Variables", y = "Values") +
+  ggtitle("Boxplots for All Numeric Variables")
+```
+
+We analyze each variable to see if these outliers should be mantained or removed if they are errors
+
+### nox_emissions
+
+It only has 1 outlier but it is huge
+
+```{r}
+mu_nox = mean(data$nox_emissions, na.rm = TRUE)
+sigma_nox = sd(data$nox_emissions, na.rm = TRUE)
+
+outliers_nox = data %>%
+  filter(nox_emissions < (mu_nox - 3 * sigma_nox) | nox_emissions > (mu_nox + 3 * sigma_nox))
+
+outliers_nox
+```
+
+This outlier must be an error since other cars of the same model do not have such a high nox emission, we suppose that they have put by error three 0s and we are correcting it.
+
+```{r}
+data$nox_emissions[data$year == 2009 & data$manufacturer == "Vauxhall" & data$model == "Signum MY2008" & data$nox_emissions == 237000] = 237
+```
+
+### Verify outliers again
+
+```{r}
+# Recalculate outliers for all numeric columns after correcting the nox_emissions value
+outlier_counts_updated = sapply(data[, numeric_columns], function(x) {
+  mu = mean(x, na.rm = TRUE)
+  sigma = sd(x, na.rm = TRUE)
+  sum(x < mu - 3*sigma | x > mu + 3*sigma, na.rm = TRUE)
+})
+
+# Print the counts of outliers for each numeric variable after correction
+outlier_counts_updated
+# Reshape the data into long format again
+long_data_updated = data %>%
+  select(where(is.numeric)) %>%
+  pivot_longer(cols = everything(), names_to = "variable", values_to = "value")
+
+# Create a giant plot with boxplots for all numeric variables
+ggplot(long_data_updated, aes(x = variable, y = value)) +
+  geom_boxplot(fill = "lightblue", color = "blue", outlier.color = "red", outlier.shape = 16) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +  # Rotate x-axis labels
+  labs(x = "Variables", y = "Values") +
+  ggtitle("Boxplots for All Numeric Variables After Correction")
+
+```
+
+We see that nox_emissions now have 723 outliers, Now we may analyze co_emissions since it has really extreme values as well.
+
+```{r}
+mu_co2 = mean(data$co_emissions, na.rm = TRUE)
+sigma_co2 = sd(data$co_emissions, na.rm = TRUE)
+outliers_co_emissions = data %>%
+  filter(co_emissions < (mu_co2 - 3 * sigma_co2) | co_emissions > (mu_co2 + 3 * sigma_co2))
+outliers_co_emissions
+```
+
+These outliers make no sense, We suppose they have put two more 0s, so we fix it
+
+```{r}
+# Identify the rows where the 'co_emissions' column has values like 70000, 75000, etc.
+data$co_emissions[data$co_emissions %in% c(70000, 75000, 71000, 72000, 74000, 73000)] =
+  data$co_emissions[data$co_emissions %in% c(70000, 75000, 71000, 72000, 74000, 73000)] / 100
+```
+
+Now we may analyze each variable which have outliers by groups that have the similar magnitudes of units.
+
+```{r}
+str(data)
+```
+
+### engine capacity, fuel cost and co emissions
+
+```{r}
+# Boxplot for Engine Capacity, Fuel Cost, and CO Emissions
+engine_fuel_co2_data = data %>%
+  select(engine_capacity, fuel_cost, co_emissions) %>%
+  mutate(across(everything(), scale))
+
+# Reshape the data into long format
+long_engine_fuel_co2 = engine_fuel_co2_data %>%
+  pivot_longer(cols = everything(), names_to = "variable", values_to = "value")
+
+# Create the boxplot
+ggplot(long_engine_fuel_co2, aes(x = variable, y = value)) +
+  geom_boxplot(fill = "lightblue", color = "blue", outlier.color = "red", outlier.shape = 16) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +  # Rotate x-axis labels
+  labs(x = "Variables", y = "Values") +
+  ggtitle("Boxplots for Engine Capacity, Fuel Cost, and CO Emissions")
+```
+
+- For engine_capacity, there are really high values but they are normal for luxury cars, however, there is a low outlier that do not make sense. We search for them using the interquartile range.
+
+```{r}
+Q1_engine_capacity = quantile(data$engine_capacity, 0.25, na.rm = TRUE)
+Q3_engine_capacity = quantile(data$engine_capacity, 0.75, na.rm = TRUE)
+
+# Calculate the IQR
+IQR_engine_capacity = Q3_engine_capacity - Q1_engine_capacity
+
+# Identify low outliers (values below Q1 - 1.5 * IQR)
+low_outliers_engine_capacity = data %>%
+  filter(engine_capacity < (Q1_engine_capacity - 1.5 * IQR_engine_capacity))
+
+low_outliers_engine_capacity
+
+```
+
+When other models of this car have values for engine_capacity of 2000, we can only assume that they have missed a 0, so we correct it.
+
+```{r}
+data$engine_capacity[data$model == "Jeep Compass, MY2014" & data$year == 2013] = 2090
+```
+
+- For fuel_cost, there are some higher and lower values, but they are normal since some fuel cost more and some less.
+<br>
+- For co_emissions, the range is really huge, so we have seen that there is a unit inconsistency.
+<br>
+To fix this, we will multiply the really low values using 50 as threshold. We also noted that one observation has a negative value, which is impossible so we will assume the "-" was placed by error.
+
+```{r}
+# First we solve the "-" typo error
+data$co_emissions[data$co_emissions == -200] = 200
+
+# Now we fix the unit inconsistency
+
+threshold = 2
+data$co_emissions = ifelse(data$co_emissions < threshold, data$co_emissions * 1000, data$co_emissions)
+```
+
+### urban metrics
+
+```{r}
+urban_combined_data = data %>%
+  select(urban_metric, extra_urban_metric, combined_metric) %>%
+  mutate(across(everything(), scale))
+
+# Reshape the data into long format
+long_urban_combined = urban_combined_data %>%
+  pivot_longer(cols = everything(), names_to = "variable", values_to = "value")
+
+# Create the boxplot
+ggplot(long_urban_combined, aes(x = variable, y = value)) +
+  geom_boxplot(fill = "lightgreen", color = "darkgreen", outlier.color = "red", outlier.shape = 16) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +  # Rotate x-axis labels
+  labs(x = "Variables", y = "Values") +
+  ggtitle("Boxplots for Urban, Extra-Urban, and Combined Metrics")
+
+```
+
+There are extremely high outliers for extra_urban_metric and combined_metric which don't make sense at all so we may fix it
+
+```{r}
+mu_urb = mean(data$extra_urban_metric, na.rm = TRUE)
+sigma_urb = sd(data$extra_urban_metric, na.rm = TRUE)
+
+outliers_extra_urban = data %>%
+  filter(extra_urban_metric < (mu_urb - 3 * sigma_urb) | extra_urban_metric > (mu_urb + 3 * sigma_urb)) %>%
+  arrange(desc(extra_urban_metric))
+print(outliers_extra_urban)
+
+```
+
+
+
+```{r}
+mu_combined = mean(data$combined_metric, na.rm = TRUE)
+sigma_combined = sd(data$combined_metric, na.rm = TRUE)
+
+outliers_combined = data %>%
+  filter(combined_metric < (mu_combined - 3 * sigma_combined) | combined_metric > (mu_combined + 3 * sigma_combined)) %>%
+  arrange(desc(combined_metric))
+print(outliers_combined)
+
+```
+
+We fix the anormal extreme values.
+
+```{r}
+# Replace values in the extra_urban_metric column
+data$extra_urban_metric[data$extra_urban_metric == 97.9] = 9.8
+data$combined_metric[data$combined_metric == 44.0] = 4.4
+data$combined_metric[data$combined_metric == 35.8] = 3.58
+```
+
+### noise level
+
+```{r}
+# Boxplot for Noise Level
+noise_level_data = data %>%
+  select(noise_level)
+
+# Create the boxplot
+ggplot(noise_level_data, aes(x = "Noise Level", y = noise_level)) +
+  geom_boxplot(fill = "lightcoral", color = "darkred", outlier.color = "red", outlier.shape = 16) +
+  theme_minimal() +
+  labs(x = "Noise Level", y = "Value") +
+  ggtitle("Boxplot for Noise Level")
+```
+
+The noise level seems to be normal, it is normal that some cars make more noise and other less, but some make noises <1, that do not make sense at all.
+
+```{r}
+Q1_noise_level = quantile(data$noise_level, 0.25, na.rm = TRUE)
+Q3_noise_level = quantile(data$noise_level, 0.75, na.rm = TRUE)
+
+IQR_noise_level = Q3_noise_level - Q1_noise_level
+
+low_outliers_noise_level = data %>%
+  filter(noise_level < (Q1_noise_level - 1.5 * IQR_noise_level)) %>%
+  arrange(noise_level)
+print(low_outliers_noise_level)
+```
+
+We will fix them multiplying them by 100.
+
+```{r}
+threshold = 1
+data$noise_level = ifelse(data$noise_level < threshold, data$noise_level * 100, data$noise_level)
+```
+
+### co2
+
+For the outliers in CO2 it does not seem like there is any unusual thing.
+
+```{r}
+# Boxplot for CO2 Emissions
+co2_data = data %>%
+  select(co2)
+
+# Create the boxplot
+ggplot(co2_data, aes(x = "CO2 Emissions", y = co2)) +
+  geom_boxplot(fill = "lightblue", color = "blue", outlier.color = "red", outlier.shape = 16) +
+  theme_minimal() +
+  labs(x = "CO2 Emissions", y = "Value") +
+  ggtitle("Boxplot for CO2 Emissions")
+```
+
+## Missing Values
+
+Now we have to deal with the NA's. After the first exploration of missing values, we can see how now the number of missing values is lower.
+
+```{r}
+missing_data_df = data.frame(
+  Variable = names(colMeans(is.na(data)) * 100),
+  MissingPercentage = colMeans(is.na(data)) * 100
+)
+
+library(ggplot2)
+ggplot(missing_data_df, aes(x = Variable, y = MissingPercentage)) +
+  geom_bar(stat = "identity", fill = "dodgerblue") +
+  labs(x = "Variable", y = "Missing Data Percentage", 
+       title = "Missing Data Percentages") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        plot.title = element_text(hjust = 0.5))
+
+sapply(data, function(x) sum(is.na(x))) # this gives us the number of NA's per variable
+
+```
+
+However, there are still NA values for many variables. As we can see in the graph, it represents around a 12% of our data for the higher case, which is nox_emissions. We can also see some NA's in other variables like co_emissions, fuel_cost or transmission type.
+<br> 
+Nevertheless, given the last function of the chunk, we know there are a few NA's for other variables like engine_capacity.
+<br>
+
+### How do we proceed with them?
+
+First we may remove observations with NAs in transmission_type, since we can not replace this categorical variable's values with the mode, which is manual, that could lead to introduce to potential bias and can distort variability
+
+```{r}
+data = data[!is.na(data$transmission_type),] 
+```
+
+
+With the library mice loaded before, we can see how many missing values are there, showing the shared missing values between variables.
+
+However when plotting it with the original data, the names of the variables were so messy that couldn't be read, so we have designed a dataframe with those variables with NA's and change the column names to easy visualization.
+
+```{r}
+
+data2 = select(data, engine_capacity, urban_metric, extra_urban_metric, noise_level, co_emissions, nox_emissions, fuel_cost)
+
+colnames(data2) = c("EC", "UM", "EUM","NL","COE","NOXE","FC")
+
+# EC -> engine capacity / UM -> urban_metric / EUM -> extra_urban_metric 
+# NL -> noise_level / COE -> co_emissions
+# NOXE -> nox_emissions / FC -> fuel_cost
+
+md.pattern(select(data2,"EC", "UM", "EUM","NL","COE","NOXE","FC"))
+```
+
+Given the graph, we determine that the NA for "urban_metrics" and "extraurban_metrics" is the same, that there are just 8 NA's for noise level, 168 for fuel_cost (being 143 of them just NA's in that variable, as 25 observations of the data share NA's with other variables), and 247 for "co_emissions" while the missing values for "nox_emissions" is much higher.
+<br>
+Now that this relations have been given, we have to check what to do with the NA's:
+<br>
+- Remove those values
+<br>
+- Subtitute those values by the median
+<br>
+- Do a multiple-variate imputation with mice library
+<br>
+
+As indicated in the chunk below we'll proceed to the elimination of those observations with NA values for all the variables (as it doesn't even represent the 2% of our data) except urban and extraurban metric as we can set the combined_metrics value without a high change of our analysis and for nox_emissions for which we'll do a multiple_imputation with mice.
+
+```{r}
+data[is.na(data$urban_metric), ] # from this we see where are the missing values in urban_metric which are the same of extraurban_metric, observing that we have a value for combined metrics, so we can place this value there substituting the NA's
+
+data$urban_metric[is.na(data$urban_metric)] = data$combined_metric[is.na(data$urban_metric)]
+data$extra_urban_metric[is.na(data$extra_urban_metric)] = data$combined_metric[is.na(data$extra_urban_metric)]
+
+# As there are just 9 values for Noise Level, 300 for CO emissions and 150 for fuel_cost being null, which is not even a 2% of the sample, we eliminate the observations with them
+
+data = data[!is.na(data$noise_level), ]
+data = data[!is.na(data$co_emissions), ]
+data = data[!is.na(data$fuel_cost),]
+
+set.seed(42)
+
+mice.obj = mice(data, method = 'rf')
+
+mice.obj.imp = mice::complete(mice.obj)
+
+data$nox_emissions = mice.obj.imp$nox_emissions
+```
+
+To check there aren't more NA's we'll use the same function as before:
+
+```{r}
+sapply(data, function(x) sum(is.na(x)))
+```
+
+## Enviroment cleaning
+
+Having finished the steps related to the first part of our analysis, we remove all the dataframes and values which are not going to be used in the future for the optimization of the memory.
+
+```{r}
+rm(list = setdiff(ls(), "data"))
+```
+
+# 2. VISUALIZATION
+
+Before starting our analysis, we are going to use some graphs to get an initial insight from the data.
+
+## Correlation
+
+```{r}
+ggcorr(data, label = T, low = "lightblue3",  
+       mid = "white",
+       high = "pink3")
+```
+
+We can see that the most correlated variables are:
+<br>
+- co2 with fuel_cost
+<br>
+- combined_metric with co2 and fuel_cost
+<br>
+- extra_urban_metric with combined_metric, co2, and fuel_cost
+<br>
+- urban_metric with extra_urban_metric, combined_metric, co2, fuel_cost
+<br>
+- engine_capacity with urban_metric, extra_urban_metric, combined_metric, co2 and fuel_cost
+
+```{r}
+ggplot(data, aes(x = urban_metric, y = extra_urban_metric, color = combined_metric))+ 
+  geom_point(alpha = 0.7, size = 3) +  
+  scale_color_gradient(low = "blue", high = "red") +
+  labs(title = "Relation between UM, EUM and CM", color = "combined") +
+  theme_minimal() +
+  theme(legend.position = "right") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+From the ggcorr graph we have seen that the correlation between this variables is very high, we prove it with this graph, meaning that the cars tend to expend more in urban roads than in extraurban. However, it has a linear correlation of almost 1, clearly seen in this graph as it is a straight line with a few values out of it.
+<br>
+Same for the combined metrics, as the graph goes clearly in a gradient way from blue to red. If it wasn't like that, this wouldn't be as correlated
+<br>
+This huge correlation might mean that in the future for FA we will need the elimination of some of this variables so the analysis is done properly
+
+```{r}
+p = ggplot(data, aes(x = combined_metric, y = co2, 
+                      color = fuel_type, 
+                      shape = transmission_type)) +
+  geom_point(alpha = 0.6) +
+  scale_size_continuous(range = c(1, 5)) +
+  scale_colour_manual(values = c("lightpink", "green", "blue", "yellow", "purple", "cyan", "orange", "red","black","grey","brown", "magenta")) + 
+  labs(title = "CO2 vs Fuel Type",
+       x = "Combined metrics (L/100km",
+       y = "CO2 (g/km)")+
+  theme_minimal() +
+  theme(panel.grid.major = element_line(color = '#55565B', linetype = "dotted"),
+        panel.grid.minor = element_blank(),
+        plot.title = element_text(size = 20),
+        legend.position = "right")
+ggplotly(p)
+
+```
+
+This graph, which might seem a little messy gives us a lot of information about our data, same as before the co2 and combined_metrics variables are very correlated, like a 0.9, that's why the output of the consume is an almost straight line.
+<br>
+Nevertheless, we decided to divide this data depending of the type of the fuel and its transmission to see if this linearity is also kept depending of this limits, clearly seeing that those cars with the same type of fuel follow a clear line, also seeing the distribution of the "fuel_type" observations in our data, which a huge amout of data for petrol or diesel and just a few observations of the other types of fuel.
+
+## Other relations between variables
+
+```{r}
+emissions_sd <- data %>%
+  select(nox_emissions, co_emissions, euro_standard) %>%
+  pivot_longer(cols = c(nox_emissions, co_emissions), 
+               names_to = "emission_type", 
+               values_to = "emissions")
+
+ggplot(emissions_sd, aes(x = emissions, color = euro_standard)) + 
+  geom_density() +
+  theme_bw() +
+  theme(legend.position = "bottom") +
+  scale_color_brewer(palette = "Dark2") +
+  labs(title = "Emissions by Type and Euro Standard",
+       x = "Emissions",
+       color = "Euro Standard") +
+  facet_wrap(~emission_type, scales = "free")
+```
+
+In this graph, we have plotted the type of emissions given the europe standard where the car belongs to, seing that given the euro emission, the car emites a diferent amount of gases, being the most emissive type of car those belonging to the euro 6 and ordered until the euro 2, which is clearly the type of car which expulses less gases. We can also see that for almost all the cases the car which more co_emissions expulses, also more nox_emissions do, meaning that there might be also a relation between "co_emissions" and "nox_emissions" given the euro_standard even they have not a high correlation at all.
+
+```{r}
+ggplot(data, aes(x = manufacturer, y = engine_capacity)) +
+  geom_boxplot(aes(fill = manufacturer), outlier.fill = "lightblue", outlier.shape = 1) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),  
+        legend.position = "none") +                        
+  labs(title = "Engine Capacity by Manufacturer",
+       x = "Manufacturer",
+       y = "Engine Capacity (cc)")
+```
+
+By this graph we can see the engine capacity by manufacturer to see if this value changes a lot depending on the manufacturer, seeing clearly that it does, being then all the brands different when talking about the quality of the engine, nevertheless, most of them are around 1000/3000 cc while other like Bendly motors are very high.
+
+```{r}
+rm(list = setdiff(ls(), "data"))
+```
+
+# 3. PRINCIPAL COMPONENT ANALYSIS (PCA)
+
+Knowing from the previous visualization which variables are correlated, we can now reduce dimensionality with PCA.
+<br>
+First, we may convert euro_standard and transmission_type to numerical variables in order to be used in PCA. We may also remove manufacturer and fuel_type since they will not be really useful. We must as well scale the data to standardize units before PCA, though we may lose variability information.
+
+```{r}
+pca_data = data
+pca_data$euro_standard = as.numeric(factor(data$euro_standard, levels = c("Euro 2", "Euro 3", "Euro 4", "Euro 5", "Euro 6")))
+pca_data$transmission_type = as.numeric(data$transmission_type == "Automatic")
+
+pca_data = pca_data %>%
+  select(where(is.numeric))
+
+pca_data = scale(pca_data)
+```
+
+We will use Singular Value Decomposition (SVD) since we are dealing with a large and rectangular matrix.
+
+```{r}
+pca = princomp(pca_data, scale=T)
+summary(pca)
+```
+
+```{r}
+fviz_screeplot(pca, addlabels = TRUE)
+```
+
+Note that with 3 components we can already explain 76.4% of variability.
+
+## Interpretation of components.
+
+### First Component
+
+```{r}
+barplot(pca$loadings[, 1], las = 2, col = "darkcyan", 
+        main = "Contribution of Variables to Principal Component 1", 
+        ylab = "Loading", 
+        cex.names = 0.7)
+```
+
+Note that higher loadings (in absolute value) have stronger influences on the principal component. Now:
+<br>
+The year, nox emissions and euro standard, though they have low loadings, they are positive, which suggests that newer vehicles, adhering to the ones with higher Euro Standards, and higher nox emissions, contribute positively to the variance captured by this component. 
+<br>
+The rest of the variables have negative loadings, but some of them have lower values such as transmission type, noise:level or co_emissions. But others, have really high values, such as engine_capacity, the urbans, co2 or the fuel cost (high values in urbans and the fuel cost, suggests a bad efficiency). This means that this ones contribute negatively to the variance captured by this component
+<br>
+Summing up all together, we could conclude that this first component represents something like "environmental friendliness". This variable could be a summary of vehicle performance and environmental impact.
+<br>
+We can also note that the sum of the squared loadings (eigenvectos) is equal to 1.
+
+```{r}
+sum(pca$loadings[,1]^2)
+```
+
+We can also see the contribution of the variables with this graph:
+
+```{r}
+fviz_contrib(pca, choice = "var", axes = 1)
+```
+
+With this, we can now order the the models which contaminate more and less.
+<br>
+The ones that contaminate less:
+
+```{r}
+order_decreasing <- order(pca$scores[, 1], decreasing = TRUE)
+unique(data.frame(model = data$model[order_decreasing], manufacturer = data$manufacturer[order_decreasing]))[1:5, ]
+```
+
+The ones that contaminate more: 
+
+```{r}
+order_increasing <- order(pca$scores[, 1], decreasing = FALSE)
+unique(data.frame(model = data$model[order_increasing], manufacturer = data$manufacturer[order_increasing]))[1:5, ]
+```
+
+This makes sense since the ones that contaminate less are like common cars (Volkswagen, Smart, ...), while the ones that contaminate more are like deportive (Lamborghini, Ferrari, ...) 
+
+### Second Component
+
+```{r}
+barplot(pca$loadings[, 2], las = 2, col = "darkcyan", 
+        main = "Contribution of Variables to Principal Component 2", 
+        ylab = "Loading", 
+        cex.names = 0.7)
+```
+
+Seeing the loadings, we could say that PC2 is related to a balance between emissions and the vehicle specifications such as year, euro standard, transmission type, engine capacity and fuel cost. We can also see that the urbans do not really contribute anything.
+
+```{r}
+fviz_contrib(pca, choice = "var", axes = 2)
+```
+
+Seeing the relations, we could interpret PC2 as "Vehicle Modernity", since the year and the euro standard or the fuel_cost really contributes to its variability.
+<br>
+We should confirm this by ranking the cars with this component.
+<br>
+
+The most moderns:
+
+```{r}
+order_decreasing <- order(pca$scores[, 2], decreasing = TRUE)
+unique(data.frame(model = data$model[order_decreasing], 
+                  manufacturer = data$manufacturer[order_decreasing], 
+                  year = data$year[order_decreasing]))[1:5, ]
+```
+
+The least moderns: 
+
+```{r}
+order_increasing <- order(pca$scores[, 2], decreasing = FALSE)
+unique(data.frame(model = data$model[order_increasing], 
+                  manufacturer = data$manufacturer[order_increasing], 
+                  year = data$year[order_increasing]))[1:5, ]
+```
+
+It makes sense, the most moderns are the ones from recent years (2011-2013) while the least modern ones are from 2000-2001
+
+### Third Component
+
+```{r}
+barplot(pca$loadings[, 3], las = 2, col = "darkcyan", 
+        main = "Contribution of Variables to Principal Component 2", 
+        ylab = "Loading", 
+        cex.names = 0.7)
+```
+
+Seeing the loadings, we could guess that PC3 relates emissions with the engine characteristics. nox_emissions has a really high negative value and co_emissions a really high positive value. Then most variables nearly have any contribution, except noise_level and engine_capacity. So PC3 relates emissions and kinda the engine capacity and the noise level.
+
+```{r}
+fviz_contrib(pca, choice = "var", axes = 3)
+```
+
+Seeing the contributions, we could say that PC3 is a reflection of the balance between high nox emissions, which suggests more efficient engines, and high co emissions, that means less efficient technology in the engine.
+<br>
+This makes sense since higher nox emissions correspond to more efficient combustion in the engine and higher co emissions to burning more fuel than air, which leads to lower combustion temperatures. In addition, more efficient engines may be in races cars, which are also more powerful, and more noisy.
+<br>
+We may confirm this, doing a ranking.
+<br>
+
+Higher nox emissions (more efficient engines):
+
+```{r}
+order_decreasing <- order(pca$scores[, 2], decreasing = TRUE)
+unique(data.frame(model = data$model[order_decreasing], 
+                  manufacturer = data$manufacturer[order_decreasing], 
+                  year = data$year[order_decreasing]))[1:5, ]
+```
+
+Higher co emissions (less efficient engines):
+
+```{r}
+order_increasing <- order(pca$scores[, 2], decreasing = FALSE)
+unique(data.frame(model = data$model[order_increasing], 
+                  manufacturer = data$manufacturer[order_increasing], 
+                  year = data$year[order_increasing]))[1:5, ]
+```
+
+We can observe through these rankings that our hypothesis makes sense.
+
+## The Biplot
+
+A triplot is too complex, and with two components we already explain a 65.8% of the variability, which is not bad, so we will work with biplots.
+
+```{r}
+biplot(pca)
+```
+
+We can not see anything, not informative.
+<br>
+We may try now using contributions instead of loadings.
+
+```{r}
+fviz_pca_var(pca, col.var = "contrib")
+```
+
+Nicer. Dim1 and Dim2 represent PC1 and PC2. Each arrow represent each variable, and their length and direction, their importance and influence in each component. 
+<br>
+Variables pointing in similar directions, such as euro standard and year, are positively correlated, while pointing in opposite, such as euro standard and nox emissions, are negatively correlated. 
+<br>
+Variables that have 90º angle between them (they are orthogonal), have no correlation between them such as fuel cost and euro standard
+<br>
+The color, shows their relative contributions. Baby Blue arrows indicate a higher importance in the variance explained by the principal components.
+<br>
+With this biplot, we can see how PC1 is related to environment (euro standard, nox emissions) as we guessed, and PC2 with variables such as fuel_cost or engine capacity, which makes sense with our definition of "Modernity".
+
+## The Scores
+
+Here as well, we may omit PC3, since its kinda redundant, because the engine efficiency (PC3) kinda overlaps with the eco-friendliness (PC1) and the modernity (PC2).
+
+```{r}
+data.frame(z1=-pca$scores[,1],z2=pca$scores[,2]) %>% 
+  ggplot(aes(z1,z2,label=data$model,color=data$euro_standard)) + geom_point(size=0) +
+  labs(title="PCA", x="PC1 (eco-friendliness)", y="PC2 (modernity)", color = "Euro Standard") +
+  theme_bw() + scale_color_brewer(palette = "Set2")+theme(legend.position="bottom") + geom_text(size=2, hjust=0.6, vjust=0, check_overlap = TRUE) 
+```
+
+We can see how each point corresponds to an observation, and its position to the relationship to the PCs. <br>
+
+We can see in the graph how it kinda goes upwards, which makes sense since the more modern is a car, the more ecofriendly it will be.
+<br>
+In addition, we can see the clustering of points by Euro Standard, which highlights is effectiveness to measure modernity.
+<br>
+
+If we changed the color to be co2:
+
+```{r}
+data.frame(z1=-pca$scores[,1],z2=pca$scores[,2]) %>% 
+  ggplot(aes(z1,z2,label=data$model,color=data$co2)) + geom_point(size=0) +
+  labs(title="PCA", x="PC1 (eco-friendliness)", y="PC2 (modernity)", color = "co2 emissions") +
+  theme_bw() + scale_color_gradient(low = "blue", high = "red")+theme(legend.position="bottom") + geom_text(size=2, hjust=0.6, vjust=0, check_overlap = TRUE) 
+```
+
+We can see how it really affects PC1, which is ecofriendliness.
+<br>
+Now, we could as questions such as, which manufactures have most environmental friendly cars?
+
+```{r}
+data.frame(pc1 = -pca$scores[, 1], manufacturer = data$manufacturer) %>%
+  group_by(manufacturer) %>%
+  summarise(mean_pc1 = mean(pc1)) %>%
+  arrange(mean_pc1)
+```
+
+And which have the most efficient engines? 
+
+```{r}
+data.frame(pc3 = pca$scores[, 3], manufacturer = data$manufacturer) %>%
+  group_by(manufacturer) %>%
+  summarise(mean_pc3 = mean(pc3)) %>%
+  arrange(mean_pc3)
+```
+
+Are more "modern" cars from recenter years?
+
+```{r}
+data.frame(pc2 = pca$scores[, 2], year = data$year, model = data$model) %>%
+  ggplot(aes(x = year, y = pc2, label = model)) +
+  geom_point(size = 0.5, color = "darkgreen") +
+  labs(title = "Modernity vs. Year", 
+       x = "Year", 
+       y = "PC2 (Modernity)") +
+  theme_minimal() +
+  geom_text(size = 2, hjust = 0.5, vjust = -0.5, check_overlap = TRUE)
+```
+
+As we can see, yes, so our hypothesis of PC2 was great.
+<br>
+Now we may remove data that will be not used again.
+
+```{r}
+rm(list = setdiff(ls(), c("data", "pca")))
+```
+
+# 4. FACTOR ANALYSIS (FA)
+
+We know the correlations between the variables so we can now identify underlying relationships between this variables by grouping them into factors thanks to FA.
+<br>
+To start this analysis, we will get the data we will use, which will be just the numerical variables of our clean dataset. We must as well scale the data to standardize units before FA, same as with PCA.
+<br>
+As the urban metric and the extra urban metric were that highly correlated with the varible combined metrics, we have proceeded to remove them for this analysis so the factors can be easily gotten.
+
+```{r}
+data_numeric <- data[, sapply(data, is.numeric)]
+data_numeric$urban_metric <- NULL
+data_numeric$extra_urban_metric <- NULL
+data_numeric <- scale(data_numeric)
+```
+
+To get this optimal number of factors, the eigenvalues of the correlation matrix need to be computed, so once the screeplot is generated, we can get this number of factors, by identifying that point where the eigenvalues start to level off,. Typically, factors with eigenvalues greater than 1 are retained
+
+```{r}
+cor_matrix <- cor(data_numeric)
+eigenvalues <- eigen(cor_matrix)$values
+eigenvalues <- data.frame(
+  Factor = seq_along(eigenvalues), 
+  Eigenvalue = eigenvalues
+)
+
+ggplot(eigenvalues, aes(x = Factor, y = Eigenvalue)) +
+  geom_point(size = 3) +  
+  geom_line() +  
+  geom_hline(yintercept = 1, color = "red", linetype = "dashed") +
+  labs(
+    title = "Scree Plot",
+    x = "Number of factors",
+    y = "Eigenvalue"
+  ) +
+  theme_minimal()
+```
+
+Once we have chosen the number of factors, it's time to do our FA. 
+<br>
+
+## Without rotation
+
+First, we have tried to do it without rotation, recieving a good result as we have checked for both the unicities of the variables (with values higher than 0.4) and the factor loadings (also with values higher than 0.4 and unique)
+<br> 
+We have recieved that the variance explained by this factors is equal to the 69% approximately
+
+```{r}
+fa <- factanal(data_numeric, factors = 3, rotation = "none", scores="regression")
+cbind(fa$loadings, fa$uniquenesses)
+
+1 - fa$uniquenesses # all of them (except co_emissions) are higher than 0.4 so our fa looks good :)
+
+factor_loadings <- fa$loadings
+factor_loadings[factor_loadings < 0.4] <- NA
+factor_loadings # high values for each variable in just one factor (except co_emissions and noise_level) 
+```
+
+## Interpretation of results
+
+```{r}
+loadings1 <- fa$loadings[, 1]
+fa11 <- data.frame(Variable = names(loadings1), Load = loadings1)
+
+ggplot(fa11, aes(x = Variable, y = Load)) +
+  geom_bar(stat = "identity", color = "black") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  ylim(-1, 1) +
+  ggtitle("Factor 1 without rotation")
+```
+
+We plot the factor loadings for the first factor, recieving that the variables co2, combined metrics, engine_capacity, and fuel_cost have high loadings, which means that the first factor is so related with this variables
+<br>
+On the other hand, the variables year and nox_emissions are related inversly with the factor as they are negative. However the load isn't very high (as well for the co_emissions and the noise_level) so this implies this variables have a weak relation with the factor
+<br>
+Having considered all of this, this factor could be related with the environmental impact
+
+```{r}
+loadings2 <- fa$loadings[, 2]
+fa12 <- data.frame(Variable = names(loadings2), Load = loadings2)
+
+ggplot(fa12, aes(x = Variable, y = Load)) +
+  geom_bar(stat = "identity", color = "black") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  ylim(-1, 1) +
+  ggtitle("Factor 2 without rotation")
+```
+
+From the second factor the most relevant variables are clearly "year" and "fuel cost", having less importance the other variables than before as the loadings are not very high
+<br>
+This factor could be related with the evolution of the price of the fuel in the time
+
+```{r}
+loadings3 <- fa$loadings[, 3]
+fa13 <- data.frame(Variable = names(loadings3), Load = loadings3)
+
+ggplot(fa13, aes(x = Variable, y = Load)) +
+  geom_bar(stat = "identity", color = "black") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  ylim(-1, 1) +
+  ggtitle("Factor 3 without rotation")
+```
+
+For this third factor, we have a high load for nox_emissions and an inverse high load for co_emissions, while the others are not relevant for this factor. 
+<br>
+According to the graph, we could say the factor is related to the chemical emissions of the car
+<br>
+
+## Varimax rotation
+We have also tried to use the varimax rotation, recieving almost the same result when talking about variance explained, the 69%
+
+```{r}
+fa2 <- factanal(data_numeric, factors = 3, rotation = "varimax", scores="Bartlett", lower = 0.01)
+cbind(fa2$loadings, fa2$uniquenesses) 
+
+1 - fa2$uniquenesses # all of them (except co_emissions) are higher than 0.4 so our fa looks good :)
+
+factor_loadings2 <- fa2$loadings
+factor_loadings2[factor_loadings2 < 0.4] <- NA
+factor_loadings2 # it looks worse than our previous fa 
+```
+
+## Interpretation of results
+
+```{r}
+
+loadings4 <- fa2$loadings[, 1]
+fa21 <- data.frame(Variable = names(loadings4), Load = loadings4)
+
+ggplot(fa21, aes(x = Variable, y = Load)) +
+  geom_bar(stat = "identity", color = "black") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  ylim(-1, 1) +
+  ggtitle("Factor 1 with varimax rotation")
+
+```
+
+Same as with the factor without rotation, the most important variables to the construction of this factor are co2, combined_metric, engine_capacity and fuel_cost. However this time we haven't got any inverse relation
+
+<br>
+
+This factor could be again related with the environmental impact
+
+```{r}
+loadings5 <- fa2$loadings[, 2]
+fa22 <- data.frame(Variable = names(loadings5), Load = loadings5)
+
+ggplot(fa22, aes(x = Variable, y = Load)) +
+  geom_bar(stat = "identity", color = "black") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  ylim(-1, 1) +
+  ggtitle("Factor 2 with varimax rotation")
+
+```
+
+With this second factor, we have that the important variables are the same as before, the year and the fuel_cost, while the loadings of the other variables, which were positive are now negative, which implies an inverse relation with the other variables, implying inversly in the factor as well
+<br>
+Same as before, this factor could be related with the evolution of the price of the fuel in the time 
+
+```{r}
+loadings6 <- fa2$loadings[, 3]
+fa23 <- data.frame(Variable = names(loadings6), Load = loadings6)
+
+ggplot(fa23, aes(x = Variable, y = Load)) +
+  geom_bar(stat = "identity", color = "black") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  ylim(-1, 1) +
+  ggtitle("Factor 3 with varimax rotation")
+```
+
+This time things change compared to the previous factor, as now the most significant loading is nox_emissions in an inverse way, being co_emissions the most relevant positive loading, however the value is around 0.4 which means the factor is not as related to it as it is to nox_emissions. It is clear that in this factor the participation of the variables is not very important, just for nox_emissions
+
+<br>
+
+However, same as before, this factor could be related to the chemical emissions of the car.
+
+## Final considerations of the FA
+
+Variance Explained: The three factors identified explain approximately 69% of the total variance, indicating a strong representation of the dataset.
+<br>
+Factor Interpretations:
+<br>
+Factor 1 (Environmental Impact): Related to CO2 emissions, combined metrics, engine capacity, and fuel cost.
+<br>
+Factor 2 (Fuel Prices Over Time): Driven by year and fuel_cost, reflecting economic trends.
+<br>
+Factor 3 (Chemical Emissions): Dominated by NOx emissions, with a weaker relationship to CO emissions.
+<br>
+Rotation Effects: The results for both rotations were similar, however we'll take the unrotated analysis as the relationships are clearer.
+<br>
+This analysis effectively reduces dataset complexity, offering insights into vehicle environmental performance, economic trends, and emissions.
+
+## Enviroment cleaning
+
+We remove again the enviroment for cleaness and efficiency in the upcoming analysis
+
+```{r}
+rm(list = setdiff(ls(), c("data","pca","fa")))
+```
+
+# 5. CLUSTERING
+
+Now it's time to see if the data could be splitted into groups of similar qualities with the use of clustering. For that we will use a sample of 2500 observations of our data extracted from the PCA as if we used the original data, the eficiency of the functions would be very low. 
+<br> 
+We sample the data and we arbritarily chose k =5 for creaing a fit with kmeans and then we get the groups to analyse how will our variables be distributed.
+
+```{r}
+pca_scores <- as.data.frame(pca$scores[,1:3])
+sampled_indices <- sample(1:nrow(pca_scores), 2500)
+cluster_data <- pca_scores[sampled_indices, ]
+d_s <- data[sampled_indices,]
+cluster_data2 <- pca_scores[sample(1:nrow(pca_scores), 2500), ]
+k = 5
+set.seed(123)
+fit = kmeans(cluster_data,k, iter.max = 50, nstart = 500) 
+fit2 = kmeans(cluster_data,k, iter.max = 50, nstart = 500) 
+par(mfrow = c(1, 2))
+groups = fit$cluster
+groups2 = fit2$cluster
+barplot(table(groups), col="deeppink2")
+barplot(table(groups2), col="blue")
+
+for (i in 1:k) {
+  barplot(fit$centers[i, ], las = 2, col = rainbow(k)[i], main = paste("Fit 1: Center of the cluster", i))
+  barplot(fit2$centers[i, ], las = 2, col = rainbow(k)[i], main = paste("Fit 2: Center of the cluster", i))
+}
+par(mfrow = c(1, 1))
+```
+
+As we have chosen a sample of the data we have done to fittings of the clusters to prove that they are going to be the same, however the distribution of the data in the groups might change, but it always follow the same patterns. We can see it down:
+
+```{r}
+# clusplot
+fviz_cluster(fit, data = cluster_data, geom = c("point"), ellipse.type = 'norm', pointsize = 1) +
+  theme_minimal() + geom_text(aes(label = d_s$manufacturer),
+              size = 3, 
+              vjust = 1, 
+              hjust = 0.5, 
+              check_overlap = TRUE)
+fviz_cluster(fit2, data = cluster_data, geom = c("point"), ellipse.type = 'norm', pointsize = 1) +
+  theme_minimal()
+```
+
+We do the same with eclust:
+
+```{r}
+fit.kmeans <- eclust(cluster_data, "kmeans", stand=TRUE, k=5)
+fit.kmeans <- eclust(cluster_data, "kmeans", stand=TRUE, k=5)
+```
+
+Now we use silhoutte which is a metric used to calculate the goodness of a clustering algorithm.
+
+```{r}
+d <- dist(scale(cluster_data), method="manhattan") 
+sil = silhouette(groups, d)
+plot(sil, col=1:5, main="", border=NA)
+summary(sil)
+```
+
+```{r}
+# the same with factoextra
+fviz_silhouette(fit.kmeans)
+```
+
+If recieving a 1 or values close to 1, would mean the clusters divide properly our data, however, in this case the values are closer to 0 which might mean that we have to choose another number of clusters, that our data isn't very clear to be divided or that we have to take another distance
+
+```{r}
+fviz_nbclust(scale(cluster_data), kmeans, method = 'silhouette',iter.max = 100, k.max = 10, nstart = 100)
+fviz_nbclust(scale(cluster_data), kmeans, method = 'wss',iter.max = 100, k.max = 10, nstart = 100)
+fviz_nbclust(scale(cluster_data), kmeans, method = 'gap_stat',iter.max = 100, k.max = 5, nstart = 25, nboot = 100)
+```
+
+We choose another number of clusters and we get by the first one and the second (by applying the elbow method) that the optimal number of clusters is 4, which means that our data is going to be better divided in 4 subgroups
+
+## PAM
+
+It's an stronger version than k-means which implies clustering of the data into k clusters 
+
+```{r}
+fit.pam <- eclust(cluster_data, "pam", stand=TRUE, k=5, graph=F)
+
+fviz_cluster(fit.pam, data = cluster_data, geom = c("point"), ellipse.type = 'norm', pointsize = 1) +
+  theme_minimal() 
+```
+We can see it is very similar to the previous cluster
+<br>
+And same as before, we have to determine how would our data be splitted in a better way
+```{r}
+fviz_nbclust(scale(cluster_data), pam, method = 'silhouette', k.max = 10)
+```
+And same as before, the optimal number of clusters according to this command is 4.
+<br>
+How similar are the clusters?
+```{r}
+adjustedRandIndex(fit.kmeans$cluster, fit.pam$clustering) 
+```
+The clusters have a similarity of around 50%
+<br> 
+
+## Repetition with k = 4
+
+SO GIVEN THAT WE HAVE CHECKED THAT 4 CLUSTERS IS GOING TO BE THE MOST OPTIMAL CASE, WE SPLIT THE DATA INTO 4 CLUSTERS
+<br> 
+As all we are going to do is already explained above, we are just going to interpret the results
+
+```{r}
+k = 4
+set.seed(123)
+fit = kmeans(cluster_data,k, iter.max = 50, nstart = 500) 
+par(mfrow = c(2, 3))
+groups = fit$cluster
+groups2 = fit2$cluster
+barplot(table(groups), col="deeppink2")
+
+for (i in 1:k) {
+  barplot(fit$centers[i, ], las = 2, col = rainbow(k)[i], main = paste("Fit 1: Center of the cluster", i))
+}
+
+par(mfrow = c(1, 1))
+
+fviz_cluster(fit, data = cluster_data, geom = c("point"), ellipse.type = 'norm', pointsize = 1) +
+  theme_minimal() + geom_text(aes(label = d_s$manufacturer),
+              size = 3, 
+              vjust = 1, 
+              hjust = 0.5, 
+              check_overlap = TRUE)
+fit.kmeans <- eclust(cluster_data, "kmeans", stand=TRUE, k=4)
+
+d <- dist(scale(cluster_data), method="manhattan")  
+sil = silhouette(groups, d)
+plot(sil, col=1:5, main="", border=NA)
+summary(sil)
+fviz_silhouette(fit.kmeans)
+```
+
+Now we repete the PAM:
+
+```{r}
+fit.pam <- eclust(cluster_data, "pam", stand=TRUE, k=4, graph=F)
+
+fviz_cluster(fit.pam, data = cluster_data, geom = c("point"), ellipse.type = 'norm', pointsize = 1) +
+  theme_minimal() + geom_text(aes(label = d_s$manufacturer),
+              size = 3, 
+              vjust = 1, 
+              hjust = 0.5, 
+              check_overlap = TRUE)
+```
+
+```{r}
+adjustedRandIndex(fit.kmeans$cluster, fit.pam$clustering) 
+```
+
+## Interpretation of the results for the optimal number of clusters
+
+The sample of the PCA was finally divided into 4 clusters, as it is the optimal number of clusters according to the functions above 
+<br>
+Both clusters have a similarity of around 76%
+<br>
+Dimensions 1 (34.7%) and 2 (33.5%) together explain a significant portion of the variance,
+<br>
+Given the PAM clustering and the k-means, we have determined for both that the clusters mean the following:
+<br>
+Cluster 1 (Red): Represents affordable, mass-market brands (538 values*)
+<br>
+Cluster 2 (Green): Mid-range to premium brands (262 values*)
+<br>
+Cluster 3 (Cyan): High-end luxury and performance brands (732 values*)
+<br>
+Cluster 4 (Purple): Niche or specialized brands with unique features.(968 values*)
+<br>
+Depending on this clusters we can see this brands share aspects related to the enviroment impact, modernity and engine efficiency given the price of the car.
+<br>
+*IMPORTANT! This is a result given the sampling of the data, it might be different
+
+## Heatmaps
+
+To the assistance with the understanding of the data we could plot a heatmap which shows correlations between the observations
+```{r}
+heatmap(scale(cluster_data), scale = "none",
+        distfun = function(x){dist(x, method = "euclidean")},
+        hclustfun = function(x){hclust(x, method = "ward.D2")},
+        cexRow = 0.7)
+```
+
+## EM clustering
+Now we proceed with Expectation-Maximization clustering which is like k-means but computes probabilities of cluster memberships based on probability distributions 
+
+```{r}
+res.Mclust <- Mclust(scale(cluster_data))
+summary(res.Mclust)
+
+head(res.Mclust$z)
+
+head(res.Mclust$classification)
+```
+
+We used the Mclust() function from the mclust package to fit a Gaussian finite mixture model on the scaled cluster_data. This approach identifies clusters assuming the data comes from a mixture of Gaussian distributions.
+<br>
+The model selected the VEV parameterization (ellipsoidal clusters with equal shape) with 9 components based on BIC (Bayesian Information Criterion).
+```{r}
+fviz_mclust(object = res.Mclust, what = "BIC", pallete = "jco") +
+  scale_x_discrete(limits = c(1:10))
+```
+
+
+```{r}
+fviz_mclust(object = res.Mclust, what = "classification", geom = "point",
+            pallete = "jco")+ geom_text(aes(label = d_s$manufacturer),
+              size = 3, 
+              vjust = 1, 
+              hjust = 0.5, 
+              check_overlap = TRUE)
+```
+
+BIC and ICL Scores:
+<br>
+BIC = -18669.28: Indicates the model’s goodness of fit while penalizing complexity.
+<br>
+ICL = -19398.36: Similar to BIC but more stringent, incorporating clustering quality.
+<br>
+The dataset was divided into 9 clusters with varying sizes (e.g., Cluster 1 has 170 members, Cluster 2 has 404, and so on).
+
+```{r}
+adjustedRandIndex(res.Mclust$classification, fit.pam$clustering) 
+```
+
+ARI = 0.338: Indicates moderate agreement between the two clustering methods.
+
+## Hierarchical clustering
+
+### Agglomerative 
+
+We will perform this clustering on the dataset after the PCA, and using the first 5 components, which would explain a 91.4% of the variance. In addition, even after the pca the dataset size is too large for hierarchical clustering so we may perform a sampling, randomly selectly 100 rows.
+
+```{r}
+set.seed(123)
+sample_indices <- sample(1:nrow(pca$scores), 100)
+cluster_data <- pca$scores[sample_indices, 1:5]
+```
+
+We may use Euclidean Distance (since we are doing the clustering over the PCA) and Ward's Linkage since Single and Complete Linkage can not be used due to the number of outliers that we have.
+
+```{r}
+d = dist(scale(cluster_data), method = "euclidean")
+hc = hclust(d, method = "ward.D2")
+```
+
+We may plot a Dendogram to check if our criteria was good.
+
+```{r}
+hc$labels <- paste(data$model[sample_indices], data$manufacturer[sample_indices])
+
+fviz_dend(x = hc, 
+          k = 5,                
+          palette = "jco",      
+          rect = TRUE,              
+          rect_fill = TRUE,         
+          rect_border = "jco",   
+          main = "Agglomerative Clustering Dendrogram")
+```
+
+Difficult to see anything, we may try with a phylogenic tree to improve readability.
+
+```{r}
+fviz_dend(x = hc,
+          k = 5,
+          color_labels_by_k = TRUE,
+          cex = 0.8,
+          type = "phylogenic",
+          repel = TRUE)+  
+labs(title="Fuel Emissions agglomerative tree clustering of car models") + theme(axis.text.x=element_blank(),axis.text.y=element_blank())
+```
+
+We can see how they are grouped by their emissions in each branch, and with colors. The ones that emit more are on the top, while the ones that emit less are at the bottom. Now we may cut the tree. 
+
+```{r}
+clusters <- cutree(hc, k = 5)
+table(clusters)
+table(cutree(hc, h=8.05)) # seeing the dendrogram and trying with values between 7 and 9
+```
+
+As we can see, the height were we cut the tree to have 5 clusters would be 8.05 aprox.
+
+```{r}
+fviz_dend(x = hc, 
+          k = 5,                
+          palette = "jco",      
+          rect = TRUE,              
+          rect_fill = TRUE,         
+          rect_border = "jco",   
+          main = "Agglomerative Clustering Dendrogram") + 
+  geom_hline(yintercept = 8.05, linetype = "dashed", color = "green") 
+```
+
+We have successfully grouped the observations using ward's linkage and k = 5.
+
+### Divisive
+
+To perform divisive clustering we may use the diana() function from the cluster library.
+
+```{r}
+diana_hc <- diana(scale(cluster_data))
+str(diana_hc)
+```
+
+Now me may plot a dendrogram.
+
+```{r}
+diana_hc$order.lab <- paste(data$model[sample_indices], data$manufacturer[sample_indices])
+fviz_dend(diana_hc, 
+          k = 5,             
+          palette = "jco",      
+          rect = TRUE,          
+          rect_fill = TRUE,   
+          rect_border = "jco",  
+          main = "Divisive Clustering Dendrogram",
+          labels_track_height = 0.8) 
+```
+
+We can see that there is one cluster that has really few data, that is because it doesn't align with any other group. We may try with a phylogenic tree for better readability.
+
+```{r}
+fviz_dend(diana_hc,
+          k = 5,
+          color_labels_by_k = TRUE,
+          cex = 0.8,
+          type = "phylogenic",
+          repel = TRUE) +  
+  labs(title = "Fuel Emissions Tree Clustering of Car Models (Divisive)") + 
+  theme(axis.text.x = element_blank(), axis.text.y = element_blank())
+```
+
+We can see how the tree starts from a root that contains all models and then it progressively splits in branches with subgroups which are more specific, with cars with similar characteristics. 
+<br>
+We could say that red cars are the ones that make more emissions, green cars intermediate, and blue the more clean ones.
+<br>
+We do have as well some isolated cars due to their characteristics, probably being outliers.
+<br>
+Then, we also have a pink point, only 1 car, that is probably because of our small sample size.
+<br>
+We may cut this tree as well.
+
+```{r}
+clusters_divisive <- cutree(diana_hc, k = 5)
+table(clusters_divisive)
+diana_hc$height <- sort(diana_hc$height)
+table(cutree(diana_hc, h = 5.6))  
+```
+
+Visually we saw that the height where to cut it is between 5 and 6.
+
+```{r}
+fviz_dend(diana_hc,
+          k = 5,
+          palette = "jco",
+          rect = TRUE,
+          rect_fill = TRUE,
+          rect_border = "jco",
+          main = "Divisive Clustering Dendrogram") + 
+  geom_hline(yintercept = 5.6, linetype = "dashed", color = "green")
+```
+
+And after representing it, we can see how we have divided the observations in 5 groups.
+
+
+
+
